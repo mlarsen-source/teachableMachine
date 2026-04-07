@@ -2,29 +2,54 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1.0" />
-    <title>Teachable Machine App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gesture Race</title>
     <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
       body {
         font-family: sans-serif;
-        max-width: 600px;
+        max-width: 500px;
         margin: 2rem auto;
         padding: 0 1rem;
         text-align: center;
       }
-      #webcam-container canvas {
-        display: none;
-        border-radius: 8px;
+      h1 { margin-bottom: 1rem; }
+
+      #webcam-container canvas { display: none; border-radius: 8px; }
+      #webcam-container.active canvas { display: block; margin: 0 auto; }
+
+      .bar-wrapper {
+        margin: 0.75rem 0;
+        text-align: left;
       }
-      #webcam-container.active canvas {
-        display: block;
+      .bar-label {
+        font-size: 0.85rem;
+        font-weight: bold;
+        margin-bottom: 0.25rem;
       }
-      #label-container div {
-        font-size: 1.1rem;
-        padding: 0.25rem 0;
+      .bar-track {
+        width: 100%;
+        height: 24px;
+        background: #e5e7eb;
+        border-radius: 4px;
+        overflow: hidden;
       }
+      .bar-fill {
+        height: 100%;
+        width: 0%;
+        border-radius: 4px;
+        transition: width 0.1s linear;
+      }
+      #timer-fill { background: #ef4444; }
+      #player-fill { background: #22c55e; }
+
+      #prompt {
+        font-size: 1.5rem;
+        font-weight: bold;
+        margin: 1rem 0;
+        min-height: 2rem;
+      }
+
       button {
         padding: 0.6rem 1.5rem;
         font-size: 1rem;
@@ -33,131 +58,206 @@
         border: none;
         color: white;
         background: #2563eb;
+        margin: 0.5rem 0.25rem;
+      }
+      button:hover { opacity: 0.9; }
+      button.stop { background: #dc2626; }
+      button:disabled { opacity: 0.5; cursor: default; }
+
+      #result {
+        font-size: 2rem;
+        font-weight: bold;
         margin: 1rem 0;
       }
-      button.stop {
-        background: #dc2626;
-      }
-      button:hover {
-        opacity: 0.9;
+      #debug {
+        font-size: 0.75rem;
+        color: #888;
+        margin-top: 0.5rem;
       }
     </style>
   </head>
   <body>
-    <h1>My Teachable Machine App</h1>
+    <h1>Gesture Race</h1>
 
-    <button
-      id="toggleButton"
-      onclick="toggleCamera()">
-      Start Camera
-    </button>
+    <button id="startBtn" onclick="startGame()">Start Game</button>
+    <button id="restartBtn" onclick="restartGame()" style="display:none;">Play Again</button>
 
     <div id="webcam-container"></div>
-    <div id="label-container"></div>
-    <div id="box"></div>
-    <div id="message"></div>
+
+    <div id="prompt"></div>
+
+    <div class="bar-wrapper">
+      <div class="bar-label">⏱ Timer</div>
+      <div class="bar-track">
+        <div class="bar-fill" id="timer-fill"></div>
+      </div>
+    </div>
+
+    <div class="bar-wrapper">
+      <div class="bar-label">✋ Your Progress</div>
+      <div class="bar-track">
+        <div class="bar-fill" id="player-fill"></div>
+      </div>
+    </div>
+
+    <div id="result"></div>
+    <div id="debug"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
     <script>
-      // REPLACE THIS with your model URL from Teachable Machine:
-      const URL = "https://teachablemachine.withgoogle.com/models/EVsD4frLm/";
+      const MODEL_URL = "https://teachablemachine.withgoogle.com/models/EVsD4frLm/";
+      const GESTURES = ["Thumbs up", "Thumbs down", "Okay"];
+      const TIMER_DURATION = 45;        // seconds
+      const PLAYER_FILL_TIME = 10;      // seconds of correct gesture to win
+      const CONFIDENCE_THRESHOLD = 0.7;
 
-      let model, webcam, labelContainer, maxPredictions;
+      let model, webcam;
       let isRunning = false;
+      let gameActive = false;
+      let timerStart = 0;
+      let playerProgress = 0;          // 0 to 1
+      let targetGesture = "";
+      let lastFrameTime = 0;
 
-      async function init() {
-        model = await tmImage.load(URL + "model.json", URL + "metadata.json");
-        maxPredictions = model.getTotalClasses();
+      // Thresholds where the gesture changes
+      const CHANGE_AT = [0.33, 0.66];
+      let nextChangeIndex = 0;
 
-        webcam = new tmImage.Webcam(300, 300, true);
+      function pickRandomGesture(exclude) {
+        const choices = GESTURES.filter(g => g !== exclude);
+        return choices[Math.floor(Math.random() * choices.length)];
+      }
+
+      async function loadModel() {
+        model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+      }
+
+      async function setupWebcam() {
+        webcam = new tmImage.Webcam(250, 250, true);
         await webcam.setup();
         await webcam.play();
-
         const container = document.getElementById("webcam-container");
         container.innerHTML = "";
         container.appendChild(webcam.canvas);
         container.classList.add("active");
+      }
 
-        labelContainer = document.getElementById("label-container");
-        labelContainer.innerHTML = "";
-        for (let i = 0; i < maxPredictions; i++) {
-          labelContainer.appendChild(document.createElement("div"));
-        }
+      async function startGame() {
+        document.getElementById("startBtn").disabled = true;
+        document.getElementById("startBtn").textContent = "Loading...";
+        document.getElementById("result").textContent = "";
+        document.getElementById("restartBtn").style.display = "none";
 
+        if (!model) await loadModel();
+        await setupWebcam();
+
+        // Reset state
+        playerProgress = 0;
+        nextChangeIndex = 0;
+        targetGesture = pickRandomGesture("");
+        document.getElementById("prompt").textContent = "Do: " + targetGesture;
+        document.getElementById("timer-fill").style.width = "0%";
+        document.getElementById("player-fill").style.width = "0%";
+
+        timerStart = performance.now();
+        lastFrameTime = timerStart;
         isRunning = true;
-        window.requestAnimationFrame(loop);
+        gameActive = true;
+
+        document.getElementById("startBtn").style.display = "none";
+        requestAnimationFrame(loop);
+      }
+
+      function endGame(won) {
+        gameActive = false;
+        isRunning = false;
+        webcam.stop();
+        document.getElementById("webcam-container").classList.remove("active");
+
+        const resultEl = document.getElementById("result");
+        if (won) {
+          resultEl.textContent = "🎉 You Win!";
+          resultEl.style.color = "#22c55e";
+        } else {
+          resultEl.textContent = "⏰ Time's Up!";
+          resultEl.style.color = "#ef4444";
+        }
+        document.getElementById("prompt").textContent = "";
+        document.getElementById("restartBtn").style.display = "inline-block";
+      }
+
+      function restartGame() {
+        document.getElementById("startBtn").style.display = "inline-block";
+        document.getElementById("startBtn").disabled = false;
+        document.getElementById("startBtn").textContent = "Start Game";
+        document.getElementById("result").textContent = "";
+        document.getElementById("restartBtn").style.display = "none";
+        document.getElementById("timer-fill").style.width = "0%";
+        document.getElementById("player-fill").style.width = "0%";
+        document.getElementById("prompt").textContent = "";
+        document.getElementById("debug").textContent = "";
+        startGame();
       }
 
       async function loop() {
         if (!isRunning) return;
+
+        const now = performance.now();
+        const dt = (now - lastFrameTime) / 1000; // delta in seconds
+        lastFrameTime = now;
+
+        // Update timer
+        const elapsed = (now - timerStart) / 1000;
+        const timerPct = Math.min(elapsed / TIMER_DURATION, 1);
+        document.getElementById("timer-fill").style.width = (timerPct * 100) + "%";
+
+        if (timerPct >= 1) {
+          endGame(false);
+          return;
+        }
+
+        // Predict
         webcam.update();
-        await predict();
-        window.requestAnimationFrame(loop);
-      }
+        const predictions = await model.predict(webcam.canvas);
 
-async function predict() {
-    const prediction = await model.predict(webcam.canvas);
-
-    // Find the class with the highest probability
-    let topClass = prediction[0];
-    for (let i = 1; i < prediction.length; i++) {
-        if (prediction[i].probability > topClass.probability) {
-            topClass = prediction[i];
+        let topClass = predictions[0];
+        for (let i = 1; i < predictions.length; i++) {
+          if (predictions[i].probability > topClass.probability) {
+            topClass = predictions[i];
+          }
         }
-    }
 
-    // topClass.className is the winning label
-    // topClass.probability is how confident the model is
-    console.log(topClass.className, topClass.probability);
+        document.getElementById("debug").textContent =
+          "Detected: " + topClass.className + " (" + (topClass.probability * 100).toFixed(0) + "%)";
 
-    // Update the display
-    for (let i = 0; i < maxPredictions; i++) {
-        const classPrediction =
-            prediction[i].className + ": " + prediction[i].probability.toFixed(2);
-        labelContainer.childNodes[i].innerHTML = classPrediction;
-    }
+        // Check if correct gesture
+        const isCorrect =
+          topClass.className === targetGesture &&
+          topClass.probability > CONFIDENCE_THRESHOLD;
 
-      if (topClass.className === "Okay" && topClass.probability > 0.8) {
-        document.body.style.backgroundColor = "#4ade80"; // green
-      } else if (topClass.className === "Thumbs down" && topClass.probability > 0.8) {
-        document.body.style.backgroundColor = "#f87171"; // red
-      } else {
-        document.body.style.backgroundColor = "white";
-      }
-
-      const messageEl = document.getElementById("message");
-      if (topClass.className === "Okay" && topClass.probability > 0.85) {
-        messageEl.textContent = "Hello!";
-      } else {
-        messageEl.textContent = "";
-      }
-
-      const box = document.getElementById("box");
-      if (topClass.className === "Thumbs down" && topClass.probability > 0.7) {
-        box.style.transform = "translateX(-100px)";
-      } else if (topClass.className === "Thumbs up" && topClass.probability > 0.7) {
-        box.style.transform = "translateX(100px)";
-      } else {
-        box.style.transform = "translateX(0)";
-}
-    }
-
-      async function toggleCamera() {
-        const button = document.getElementById("toggleButton");
-        if (!isRunning) {
-          await init();
-          button.textContent = "Stop Camera";
-          button.classList.add("stop");
-        } else {
-          isRunning = false;
-          webcam.stop();
-          document
-            .getElementById("webcam-container")
-            .classList.remove("active");
-          button.textContent = "Start Camera";
-          button.classList.remove("stop");
+        if (isCorrect) {
+          playerProgress += dt / PLAYER_FILL_TIME;
+          if (playerProgress > 1) playerProgress = 1;
         }
+        // else: paused (no drain, no fill)
+
+        document.getElementById("player-fill").style.width = (playerProgress * 100) + "%";
+
+        // Check for gesture change thresholds
+        if (nextChangeIndex < CHANGE_AT.length && playerProgress >= CHANGE_AT[nextChangeIndex]) {
+          targetGesture = pickRandomGesture(targetGesture);
+          document.getElementById("prompt").textContent = "Do: " + targetGesture;
+          nextChangeIndex++;
+        }
+
+        // Win check
+        if (playerProgress >= 1) {
+          endGame(true);
+          return;
+        }
+
+        requestAnimationFrame(loop);
       }
     </script>
   </body>
